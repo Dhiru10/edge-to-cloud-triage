@@ -1,0 +1,27 @@
+name: Watchdog Lambda CI
+
+on:
+  push:
+    paths:
+      - 'watchdog-lambda/**'
+  pull_request:
+    paths:
+      - 'watchdog-lambda/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build and test
+        working-directory: watchdog-lambda/src/WatchdogLambda
+        run: |
+          dotnet restore
+          dotnet build --configuration Release
+          dotnet test ../../tests/WatchdogLambda.Tests

@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Triage watchdog — detects stale fault events and resets them for retry
+
+Parameters:
+  BackendUrl:
+    Type: String
+    Description: ALB DNS of the triage backend
+  ApiKey:
+    Type: String
+    NoEcho: true
+  SnsTopicArn:
+    Type: String
+    Default: ""
+    Description: SNS topic ARN for stale-event alerts (leave blank to disable)
+  StaleThresholdMinutes:
+    Type: Number
+    Default: 10
+  AlertThreshold:
+    Type: Number
+    Default: 5
+    Description: Minimum stale count to trigger an SNS alert
+  Environment:
+    Type: String
+    Default: prod
+
+Globals:
+  Function:
+    Timeout:      30
+    MemorySize:   256
+    Runtime:      dotnet8
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        BACKEND_URL:               !Ref BackendUrl
+        API_KEY:                   !Ref ApiKey
+        SNS_TOPIC_ARN:             !Ref SnsTopicArn
+        STALE_THRESHOLD_MINUTES:   !Ref StaleThresholdMinutes
+        ALERT_THRESHOLD:           !Ref AlertThreshold
+
+Resources:
+  WatchdogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub triage-watchdog-${Environment}
+      CodeUri:      src/WatchdogLambda/
+      Handler:      WatchdogLambda::WatchdogLambda.Function::FunctionHandler
+      Description:  Polls for stale triage jobs, resets them, and emits CloudWatch metrics
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - SNSPublishMessagePolicy:
+            TopicName: !Select [5, !Split [":", !If [HasTopic, !Ref SnsTopicArn, "arn:aws:sns:us-east-1:000000000000:placeholder"]]]
+      Events:
+        ScheduleRule:
+          Type: Schedule
+          Properties:
+            Schedule:    rate(5 minutes)
+            Description: Run watchdog every 5 minutes
+            Enabled:     true
+
+Conditions:
+  HasTopic: !Not [!Equals [!Ref SnsTopicArn, ""]]
+
+Outputs:
+  WatchdogFunctionArn:
+    Value: !GetAtt WatchdogFunction.Arn

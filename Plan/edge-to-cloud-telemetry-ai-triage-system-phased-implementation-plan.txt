@@ -1,0 +1,369 @@
+Edge-to-Cloud Telemetry & AI Triage System 2025
+Phased Implementation Plan
+
+────────────────
+Repository Layout
+
+edge-to-cloud-triage/
+├── .github/
+│   └── workflows/
+│       ├── backend-ci.yml
+│       ├── edge-client-ci.yml
+│       └── watchdog-ci.yml
+├── backend/
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/com/triage/
+│   │       │   ├── controller/
+│   │       │   ├── service/
+│   │       │   ├── repository/
+│   │       │   ├── entity/
+│   │       │   ├── dto/
+│   │       │   └── config/
+│   │       └── resources/
+│   │           ├── application.yml
+│   │           └── db/migration/       ← Flyway scripts
+│   ├── pom.xml
+│   └── Dockerfile
+├── edge-client/
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── telemetry/
+│   │   ├── transport/
+│   │   └── util/
+│   ├── include/
+│   ├── CMakeLists.txt
+│   └── Dockerfile
+├── ai-triage-agent/
+│   ├── agent/
+│   │   ├── parser.py
+│   │   ├── analyzer.py
+│   │   └── reporter.py
+│   ├── tests/
+│   ├── requirements.txt
+│   ├── main.py
+│   └── Dockerfile
+├── watchdog-lambda/                    ← C.NET 8 AWS Lambda
+│   ├── src/
+│   │   └── WatchdogLambda/
+│   │       ├── Function.cs
+│   │       ├── Models/
+│   │       ├── Services/
+│   │       └── WatchdogLambda.csproj
+│   ├── tests/
+│   │   └── WatchdogLambda.Tests/
+│   └── template.yaml                  ← SAM deployment template
+├── ui/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── pages/
+│   │   ├── api/
+│   │   └── App.tsx
+│   ├── package.json
+│   └── Dockerfile
+├── infra/
+│   ├── terraform/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── modules/
+│   │       ├── ecs/
+│   │       ├── rds/
+│   │       ├── lambda/
+│   │       └── networking/
+│   ├── docker-compose.yml              ← local dev stack
+│   └── docker-compose.override.yml
+├── docs/
+│   ├── architecture.md
+│   ├── api-reference.md
+│   ├── db-schema.md
+│   └── runbook.md
+├── .gitignore
+├── README.md
+└── CHANGELOG.md
+
+
+Notes on repo structure:
+• Each service is independently buildable and has its own Dockerfile or deployment template
+• docker-compose.yml in infra/ wires everything together for local development
+• Flyway handles all DB migrations — no raw SQL run by hand
+• .github/workflows/ provides CI from the start, which adds credibility to the repo
+
+────────────────
+Service Responsibilities
+
+| Service | Language | Responsibility |
+|────────────────|────────────────|────────────────|
+| edge-client | C++ | Collects CPU, memory, disk, process telemetry from the local host. Detects fault/crash events. Ships data to the backend over HTTP/REST. Runs as a daemon. |
+| backend | Java / Spring Boot | Receives telemetry and fault payloads. Persists to PostgreSQL. Exposes query APIs for the UI and internal services. |
+| ai-triage-agent | Python | Polls the backend for unprocessed fault events. Parses crash logs/stack traces. Produces structured root-cause reports. Posts results back to the backend. |
+| watchdog-lambda | C/ .NET 8 | AWS Lambda function. Runs on a schedule via EventBridge. Detects stale fault events the triage agent failed to process, resets them to pending, and publishes CloudWatch metrics + SNS alerts. |
+| ui | React / TypeScript | Displays live telemetry streams, device health summaries, fault event list, and triage reports. Reads directly from backend REST APIs. |
+| infra | Terraform + Docker | Local compose stack for dev. Terraform modules for AWS ECS, RDS PostgreSQL, Lambda, and VPC. |
+
+────────────────
+CWatchdog Lambda — Design & Interview Rationale
+
+What it does
+
+The watchdog-lambda is a C.NET 8 AWS Lambda function triggered every 5 minutes by an EventBridge scheduled rule. It performs three tasks:
+Stale fault detection — Queries the backend REST API for fault events stuck in processing status longer than a configured threshold (default: 10 minutes). This catches cases where the Python triage agent crashed mid-job, leaving events orphaned.
+Auto-remediation — PATCHes those stale events back to pending so the triage agent will pick them up on the next poll cycle.
+Operational visibility — Publishes a CloudWatch custom metric (TriageSystem/StaleEvents) and sends an SNS notification if the stale count exceeds a threshold.
+
+Why Cspecifically — the honest engineering answer
+
+  "We separated operational monitoring from the main backend intentionally. The Spring Boot backend owns the data plane — it receives and serves data. The watchdog is a pure ops concern: scheduled, stateless, short-lived. AWS Lambda is the natural fit for that pattern, and .NET 8 is a first-class Lambda runtime with excellent cold-start performance, especially for Lambdas in the 128–512MB range. Calso gave us strong typing for the backend's JSON contract without pulling in a full framework. In a real team you'd often see exactly this split — the backend squad owns Java, but ops tooling gets written in whatever the platform team knows, and .NET was the right call here."
+
+Why this is credible in interviews
+• It solves a real problem. The Python agent is a long-running polling service — it can crash or stall. Without a watchdog, stuck events would silently pile up. This is a genuine operational gap.
+• The language choice is justified. Con Lambda is not a forced pairing. It is used in production by teams at Microsoft, AWS itself, and many financial services companies. The cold-start characteristics of .NET 8 AOT on Lambda are well-documented and defensible.
+• The scope is appropriate. A Lambda that does one focused thing (health check + remediation) is exactly the kind of glue service a senior engineer writes to fill an operational gap without building a full service.
+• It is not bolted on. It interacts with the same backend API that every other service uses. It reads GET /api/faults?status=processing&staleSince=... and calls PATCH /api/faults/{id}/status — APIs that already exist.
+• It demonstrates multi-language system thinking. You picked Cnot because it was in the requirements checklist, but because Lambda + .NET was the right tool for a scheduled, stateless, ops-focused function. That is the answer interviewers want to hear.
+
+Folder structure (Phase 6)
+
+watchdog-lambda/
+├── src/
+│   └── WatchdogLambda/
+│       ├── Function.cs              ← Lambda handler entry point
+│       ├── Models/
+│       │   ├── FaultEvent.cs
+│       │   └── WatchdogConfig.cs
+│       ├── Services/
+│       │   ├── BackendClient.cs     ← HTTP calls to Spring Boot backend
+│       │   └── AlertPublisher.cs   ← SNS publish
+│       └── WatchdogLambda.csproj
+├── tests/
+│   └── WatchdogLambda.Tests/
+│       ├── FunctionTests.cs
+│       └── WatchdogLambda.Tests.csproj
+└── template.yaml                   ← AWS SAM template (schedule + permissions)
+
+
+────────────────
+Data Flow Between Components
+
+┌─────────────────────────────────────────────────────────────┐
+│                         Edge Host                           │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │             C++ Edge Client (daemon)                │   │
+│  │                                                     │   │
+│  │  Thread 1: Telemetry collector (CPU/mem/disk/net)   │   │
+│  │  Thread 2: Fault watcher (process crashes, signals) │   │
+│  │  Thread 3: HTTP sender (queue → REST POST)          │   │
+│  └──────────────────────┬──────────────────────────────┘   │
+└─────────────────────────┼───────────────────────────────────┘
+                          │ HTTPS REST
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Java Spring Boot Backend                       │
+│                                                             │
+│  POST /api/telemetry        → persists telemetry batch      │
+│  POST /api/faults           → persists fault event          │
+│  GET  /api/devices          → device registry               │
+│  GET  /api/faults           → fault list (UI + agent)       │
+│  PATCH /api/faults/{id}/status → status updates             │
+│  GET  /api/reports/{id}     → triage report (UI)            │
+│                                                             │
+│         ┌────────────────────────────────────┐             │
+│         │        PostgreSQL (RDS)             │             │
+│         └────────────────────────────────────┘             │
+└──────────────┬─────────────────────────▲────────────────────┘
+               │ Polls GET               │ PATCH stale events
+               │ /api/faults?status=     │ back to 'pending'
+               │ pending                 │
+               ▼                         │
+┌─────────────────────────┐   ┌──────────┴──────────────────────┐
+│  Python AI Triage Agent │   │  CWatchdog Lambda (.NET 8)    │
+│                         │   │                                  │
+│  1. Poll pending faults  │   │  Trigger: EventBridge (5 min)   │
+│  2. Parse crash logs     │   │  1. GET stale 'processing' faults│
+│  3. Analyze root cause   │   │  2. PATCH each → 'pending'       │
+│  4. POST triage report   │   │  3. Publish CloudWatch metric    │
+└─────────────────────────┘   │  4. SNS alert if threshold hit   │
+                               └──────────────────────────────────┘
+               ▲
+               │ REST reads
+┌─────────────────────────────────────────────────────────────┐
+│              React UI Dashboard                             │
+│                                                             │
+│  /devices     → device health cards                         │
+│  /telemetry   → time-series charts                          │
+│  /faults      → fault event table                           │
+│  /reports     → triage report viewer                        │
+└─────────────────────────────────────────────────────────────┘
+
+
+Key decisions:
+• Edge client does not talk directly to the triage agent — the backend owns all routing
+• Triage agent is pull-based (polls backend) — keeps the agent stateless and easy to restart
+• Watchdog Lambda is read-then-remediate — it only touches fault events that are genuinely stale, never healthy ones
+• No message broker (Kafka/RabbitMQ) in Phase 1-5 — a status column on the fault table is sufficient
+• All inter-service communication is plain REST over JSON
+
+────────────────
+Proposed Database Tables
+
+-- Registered edge devices
+devices (
+    id            UUID PRIMARY KEY,
+    hostname      TEXT NOT NULL UNIQUE,
+    os_info       TEXT,
+    agent_version TEXT,
+    registered_at TIMESTAMPTZ DEFAULT now(),
+    last_seen_at  TIMESTAMPTZ
+)
+
+-- Periodic telemetry snapshots from edge client
+telemetry_snapshots (
+    id            BIGSERIAL PRIMARY KEY,
+    device_id     UUID REFERENCES devices(id),
+    captured_at   TIMESTAMPTZ NOT NULL,
+    cpu_pct       NUMERIC(5,2),
+    mem_used_mb   INTEGER,
+    mem_total_mb  INTEGER,
+    disk_used_gb  NUMERIC(8,2),
+    disk_total_gb NUMERIC(8,2),
+    load_avg_1m   NUMERIC(6,3)
+)
+
+-- Fault/crash events detected by the edge client
+fault_events (
+    id            UUID PRIMARY KEY,
+    device_id     UUID REFERENCES devices(id),
+    occurred_at   TIMESTAMPTZ NOT NULL,
+    fault_type    TEXT NOT NULL,          -- SIGSEGV | OOM | PROCESS_EXIT | etc.
+    process_name  TEXT,
+    exit_code     INTEGER,
+    raw_log       TEXT,                   -- crash log or stack trace
+    status        TEXT DEFAULT 'pending', -- pending | processing | done | failed
+    processing_started_at TIMESTAMPTZ,   -- set when triage agent claims the event
+    created_at    TIMESTAMPTZ DEFAULT now()
+)
+
+-- AI triage reports linked to fault events
+triage_reports (
+    id              UUID PRIMARY KEY,
+    fault_event_id  UUID REFERENCES fault_events(id) UNIQUE,
+    analyzed_at     TIMESTAMPTZ DEFAULT now(),
+    root_cause      TEXT,
+    confidence      TEXT,                 -- high | medium | low
+    affected_module TEXT,
+    recommendation  TEXT,
+    raw_analysis    JSONB
+)
+
+
+Rationale:
+• processing_started_at is new — the watchdog Lambda uses this to determine if a processing event is genuinely stale (now - processing_started_at > threshold)
+• raw_log stored inline for simplicity; S3 offload path documented as future work
+• status field drives both the triage agent's work queue and the watchdog's stale detection
+• raw_analysis JSONB gives the triage agent flexibility to evolve its output schema without migrations
+• UUID primary keys on domain tables; BIGSERIAL on high-volume telemetry_snapshots
+
+────────────────
+API Surface Overview
+
+Telemetry
+| Method | Endpoint | Description |
+|────────────────|────────────────|────────────────|
+| POST | /api/telemetry | Ingest a batch of telemetry snapshots from edge client |
+| GET | /api/telemetry/{deviceId} | Query telemetry for a device (UI charts) |
+
+Devices
+| Method | Endpoint | Description |
+|────────────────|────────────────|────────────────|
+| POST | /api/devices/register | Edge client self-registers on startup |
+| GET | /api/devices | List all known devices |
+| GET | /api/devices/{id} | Device detail + latest snapshot |
+
+Faults
+| Method | Endpoint | Description |
+|────────────────|────────────────|────────────────|
+| POST | /api/faults | Edge client reports a fault event |
+| GET | /api/faults | List fault events (?status=, ?deviceId=, ?staleSince=) |
+| GET | /api/faults/{id} | Fault event detail including raw log |
+| PATCH | /api/faults/{id}/status | Update processing status (triage agent + watchdog Lambda) |
+
+Reports
+| Method | Endpoint | Description |
+|────────────────|────────────────|────────────────|
+| POST | /api/reports | Triage agent submits completed report |
+| GET | /api/reports | List all reports |
+| GET | /api/reports/{id} | Full report detail |
+
+Auth note: All services use a shared static API key (X-Api-Key header). Static key is intentional and documented; JWT or mTLS noted as the production upgrade path.
+
+────────────────
+AWS Deployment Approach
+
+VPC (edge-triage-vpc)
+├── Public Subnet
+│   └── ALB (Application Load Balancer)
+│       ├── → ECS Service: backend (Spring Boot, Fargate)
+│       └── → ECS Service: ui (nginx + React build)
+├── Private Subnet
+│   ├── ECS Service: ai-triage-agent (Fargate, no inbound)
+│   └── RDS PostgreSQL (Multi-AZ, t3.medium)
+├── Lambda
+│   └── watchdog-lambda (C.NET 8, EventBridge schedule)
+│       ├── Calls backend ALB endpoint
+│       └── Publishes to SNS topic → email/Slack alert
+└── ECR Repositories: backend, ai-triage-agent, ui
+
+
+Key decisions:
+• ECS Fargate — no EC2 to manage; sensible for a portfolio project
+• RDS PostgreSQL — not Aurora; lower cost and easier to explain
+• Lambda (C.NET 8) — scheduled, stateless, ops-only; no container needed; deployed via AWS SAM
+• ECR for container images — natural fit with ECS
+• Terraform manages all ECS/RDS/VPC/SNS/CloudWatch resources; SAM template manages the Lambda
+• Edge client runs outside AWS — talks to the ALB DNS endpoint
+• Secrets Manager stores DB password and API key; injected into ECS task definitions and Lambda environment at runtime
+• ALB handles TLS termination; internal traffic is plain HTTP
+
+────────────────
+Recommended Order of Execution
+
+| Phase | Focus | Why this order |
+|────────────────|────────────────|────────────────|
+| Phase 1 | Repo skeleton + architecture docs | Git-clean foundation before any code; docs written once, referenced throughout |
+| Phase 2 | Spring Boot backend + PostgreSQL | APIs must exist before any client can send data; everything else depends on this |
+| Phase 3 | C++ edge client | Produces real data against the running backend; validates API contracts |
+| Phase 4 | Python AI triage agent | Consumes data that now exists in the DB; can be tested with real fault events |
+| Phase 5 | React UI | Built last when all APIs are stable; avoids churn from changing endpoints |
+| Phase 6 | AWS infra + CLambda + CI + polish | Wraps working software in deployment assets; Cwatchdog solves a real gap visible only after Phase 4 runs |
+
+────────────────
+Risks and Tradeoffs
+
+| Area | Risk / Tradeoff | Mitigation |
+|────────────────|────────────────|────────────────|
+| C++ HTTP client | libcurl adds build complexity | Use CPM.cmake or vcpkg; document the dependency clearly |
+| Triage "AI" | Real ML is out of scope | Python agent uses structured pattern matching + heuristics; honest and explainable |
+| No message broker | Triage agent coupled to DB polling | Acceptable at this scale; SQS upgrade path documented in docs/architecture.md |
+| Inline raw logs | Large crash dumps in PostgreSQL TEXT will be slow at scale | Acceptable for the portfolio; S3 offload path noted as future work |
+| Auth simplicity | Static API key is not production-grade | Documented as intentional; JWT/mTLS noted as the next step |
+| Single-region AWS | No geographic DR | Multi-AZ RDS gives DB resilience; noted in runbook |
+| Lambda cold starts | .NET 8 cold starts on Lambda are ~800ms | Acceptable for a 5-minute scheduled watchdog; not on the hot path |
+| No real edge device | Edge client runs on localhost | Code is fully realistic; the dev machine is the "device" |
+
+────────────────
+
+Phase Summary
+
+Phase 1  →  Skeleton + docs            (no runnable code)
+Phase 2  →  Backend + DB               (first running service)
+Phase 3  →  C++ edge client            (data producer)
+Phase 4  →  Python triage agent        (data consumer + report writer)
+Phase 5  →  React UI                   (visualization layer)
+Phase 6  →  AWS infra + Cwatchdog    (production-ready wrapper)
+• CI pipelines + README + CHANGELOG
+
+
+────────────────
+
+Waiting for your instruction to begin Phase 1.
